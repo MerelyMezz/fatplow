@@ -622,6 +622,88 @@ uint32_t MoveFileToEnd(uint32_t ParentDirCluster, uint32_t DirEntryIndex, uint32
     return NewDirCluster;
 }
 
+void SortFileClusters(uint32_t StartCluster)
+{
+    std::vector<int32_t> Clusters = GetClusterChain(StartCluster);
+
+    std::vector<int32_t> ReorderedClusters = Clusters;
+    std::sort(ReorderedClusters.begin() + 1, ReorderedClusters.end());
+
+    if (Clusters == ReorderedClusters)
+    {
+        return;
+    }
+
+    std::vector<bool> ClustersMoved;
+    ClustersMoved.resize(ReorderedClusters.size(), false);
+
+    std::vector<uint8_t> DataStash;
+    DataStash.resize(BytesPerCluster);
+
+    std::vector<uint8_t> DataBuffer;
+    DataBuffer.resize(BytesPerCluster);
+
+    std::unordered_map<int32_t, int32_t> OriginalClusterPositions;
+    for (int i = 0; i < Clusters.size(); i++)
+    {
+        OriginalClusterPositions.emplace(Clusters[i], i);
+    }
+
+    std::unordered_map<int32_t, int32_t> ReorderedClusterPosition;
+    for (int i = 0; i < Clusters.size(); i++)
+    {
+        ReorderedClusterPosition.emplace(ReorderedClusters[i], i);
+    }
+
+    for (int i = 0; i < ReorderedClusters.size(); i++)
+    {
+        int32_t LoopStartCluster = Clusters[i];
+        int32_t DestinationCluster = LoopStartCluster;
+
+        if (Clusters[i] == ReorderedClusters[i] || ClustersMoved[i])
+        {
+            continue;
+        }
+
+        // Stash the first cluster so we can restore it at the end of the loop
+        FatFilesystem.seekg(GetDataStartByte(Clusters[i]));
+        FatFilesystem.read((char*)DataStash.data(), BytesPerCluster);
+
+        // Move clusters in a chain, until we loop around to the start
+        while (true)
+        {
+            int32_t SourceCluster = Clusters[ReorderedClusterPosition[DestinationCluster]];
+            ClustersMoved[OriginalClusterPositions[SourceCluster]] = true;
+
+            if (SourceCluster == LoopStartCluster)
+            {
+                FatFilesystem.seekp(GetDataStartByte(DestinationCluster));
+                FatFilesystem.write((char*)DataStash.data(), BytesPerCluster);
+                break;
+            }
+
+            FatFilesystem.seekg(GetDataStartByte(SourceCluster));
+            FatFilesystem.read((char*)DataBuffer.data(), BytesPerCluster);
+
+            FatFilesystem.seekp(GetDataStartByte(DestinationCluster));
+            FatFilesystem.write((char*)DataBuffer.data(), BytesPerCluster);
+
+            DestinationCluster = SourceCluster;
+        }
+    }
+
+    // Write FAT entries
+    FatEditor FE;
+
+    for (int i = 0; i < ReorderedClusters.size(); i++)
+    {
+        int32_t NewEntry = i == ReorderedClusters.size() - 1 ? 0x0FFFFFFF : ReorderedClusters[i+1];
+        FE.SetFatEntry(ReorderedClusters[i], NewEntry);
+    }
+
+    FE.SaveAllChanges();
+}
+
 void PrintFATOccupancy(int64_t Scale = 1)
 {
     FatEditor FE;
@@ -686,6 +768,10 @@ int32_t main(int32_t argc, char* argv[])
     else if (argv[1] == std::string("movefiletoend"))
     {
         MoveFileToEnd(std::stoi(argv[3]), std::stoi(argv[4]), std::stoi(argv[5]));
+    }
+    else if (argv[1] == std::string("sortfileclusters"))
+    {
+        SortFileClusters(std::stoi(argv[3]));
     }
     else if (argv[1] == std::string("printdir"))
     {
