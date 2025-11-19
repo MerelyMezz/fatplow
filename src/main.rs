@@ -332,7 +332,7 @@ struct FATFileSystem<'a>
 
     BytesPerCluster : u64,
     FATEntryCount : u32,
-    BiggestFreeCluster : u32,
+    BiggestFreeCluster : Cell<u32>,
 
     DirEntriesPerCluster : u64
 }
@@ -352,7 +352,7 @@ impl<'a> FATFileSystem<'a>
         let DataStartByte = FATStartByte + BS.Data.NumFATs as u64 * BS.Data.FATSz32 as u64 * BS.Data.BytsPerSec as u64;
 
         let FATEntryCount = (((BS.Data.TotSec32 as u64 * BS.Data.BytsPerSec as u64) - DataStartByte) / BytesPerCluster) as u32;
-        let BiggestFreeCluster = FATEntryCount + 2 - 1;
+        let BiggestFreeCluster = Cell::new(FATEntryCount + 2 - 1);
 
         let DirEntriesPerCluster = BytesPerCluster / FATDirEntrySize;
 
@@ -407,115 +407,104 @@ impl<'a> FATFileSystem<'a>
 
     fn MoveFileToEnd(&mut self, ParentDir : u32, EntryIndex : u64) -> Option<u32>
     {
-        // cant modify this while other things are immutably borrowing self,
-        // because rust is being shitty about the whole struct being borrowed.
-        // This is the least worst way of working around it for now.
-        // TODO: wrap it in Cell<>
-        let mut BiggestFreeCluster = self.BiggestFreeCluster;
-        let Result = (|| -> Option<u32>
+        let mut MovedFile = self.GetDirEntry(ParentDir, EntryIndex);
+
+        let mut FB = self.GetFatBuffer();
+
+        //Figure out the new cluster chain to move the file to
+        let CurrentClusterChain : Vec<u32> = self.GetFatIterator(MovedFile.Data.GetClusterNumber()).collect();
+        let FreeClusters : Vec<u32> =
+        (2u32..=self.BiggestFreeCluster.get()).rev()
+            .filter(|a| FB.GetFATEntry(*a) == 0)
+            .take(CurrentClusterChain.len())
+            .collect();
+
+        if FreeClusters.len() == 0
         {
-            let mut MovedFile = self.GetDirEntry(ParentDir, EntryIndex);
+            return None;
+        }
 
-            let mut FB = self.GetFatBuffer();
+        //Pick the highest clusters from either set, and put them into one chain
+        let mut PickedClusters : Vec<u32> = CurrentClusterChain.iter().chain(FreeClusters.iter()).map(|a| *a).collect();
+        PickedClusters.sort();
+        PickedClusters = PickedClusters.iter().rev().take(CurrentClusterChain.iter().len()).rev().map(|a| *a).collect();
 
-            //Figure out the new cluster chain to move the file to
-            let CurrentClusterChain : Vec<u32> = self.GetFatIterator(MovedFile.Data.GetClusterNumber()).collect();
-            let FreeClusters : Vec<u32> =
-            (2u32..=self.BiggestFreeCluster).rev()
-                .filter(|a| FB.GetFATEntry(*a) == 0)
-                .take(CurrentClusterChain.len())
-                .collect();
+        let mut NewClusters = PickedClusters.iter().filter(|a| !CurrentClusterChain.contains(a)).map(|a| *a);
 
-            if FreeClusters.len() == 0
-            {
-                return None;
-            }
-
-            //Pick the highest clusters from either set, and put them into one chain
-            let mut PickedClusters : Vec<u32> = CurrentClusterChain.iter().chain(FreeClusters.iter()).map(|a| *a).collect();
-            PickedClusters.sort();
-            PickedClusters = PickedClusters.iter().rev().take(CurrentClusterChain.iter().len()).rev().map(|a| *a).collect();
-
-            let mut NewClusters = PickedClusters.iter().filter(|a| !CurrentClusterChain.contains(a)).map(|a| *a);
-
-            let NewClusterChain : Vec<u32> = (0..CurrentClusterChain.len())
-                .map(|i|
-                    {
-                        if PickedClusters.contains(&CurrentClusterChain[i])
-                        {
-                            return CurrentClusterChain[i];
-                        }
-                        else
-                        {
-                            return NewClusters.next().unwrap();
-                        }
-                    })
-                .collect();
-
-            BiggestFreeCluster = *NewClusterChain.iter().min().unwrap();
-
-            if NewClusterChain == CurrentClusterChain
-            {
-                return None;
-            }
-
-            // Copy Data
-            let mut DataBuffer = Vec::<u8>::new();
-            DataBuffer.resize(self.BytesPerCluster as usize, 0);
-            let mut R = BufReader::new(self.OpenedFile);
-            let mut W = BufWriter::new(self.OpenedFile);
-
-            (0..CurrentClusterChain.len()).for_each(
-                |i|
+        let NewClusterChain : Vec<u32> = (0..CurrentClusterChain.len())
+            .map(|i|
                 {
-                    if CurrentClusterChain[i] == NewClusterChain[i] {return;}
+                    if PickedClusters.contains(&CurrentClusterChain[i])
+                    {
+                        return CurrentClusterChain[i];
+                    }
+                    else
+                    {
+                        return NewClusters.next().unwrap();
+                    }
+                })
+            .collect();
 
-                    R.seek(SeekFrom::Start(self.GetClusterStartByte(CurrentClusterChain[i])));
-                    R.read(&mut DataBuffer);
+        self.BiggestFreeCluster.set(*NewClusterChain.iter().min().unwrap());
 
-                    W.seek(SeekFrom::Start(self.GetClusterStartByte(NewClusterChain[i])));
-                    W.write(&DataBuffer);
+        if NewClusterChain == CurrentClusterChain
+        {
+            return None;
+        }
+
+        // Copy Data
+        let mut DataBuffer = Vec::<u8>::new();
+        DataBuffer.resize(self.BytesPerCluster as usize, 0);
+        let mut R = BufReader::new(self.OpenedFile);
+        let mut W = BufWriter::new(self.OpenedFile);
+
+        (0..CurrentClusterChain.len()).for_each(
+            |i|
+            {
+                if CurrentClusterChain[i] == NewClusterChain[i] {return;}
+
+                R.seek(SeekFrom::Start(self.GetClusterStartByte(CurrentClusterChain[i])));
+                R.read(&mut DataBuffer);
+
+                W.seek(SeekFrom::Start(self.GetClusterStartByte(NewClusterChain[i])));
+                W.write(&DataBuffer);
+            });
+
+        // Write to FAT
+        CurrentClusterChain.iter().for_each(|a|FB.SetFATEntry(*a, 0));
+        NewClusterChain.iter().zip(NewClusterChain.iter().rev().take(NewClusterChain.len() - 1).rev().chain([0x0FFFFFFF].iter())).for_each(|(This,Next)| FB.SetFATEntry(*This, *Next));
+        FB.FATSegment.borrow_mut().WriteBack();
+
+        // Set clusters in dir entry right
+        let NewCluster = NewClusterChain[0];
+        MovedFile.Data.SetClusterNumber(NewCluster);
+        MovedFile.WriteBack();
+
+        if MovedFile.Data.IsDir()
+        {
+            // Set . entry right
+            self.GetDirIterator(NewCluster).filter(|(a, _)| a.Data.IsDir() && a.Data.IsDot()).for_each(
+                |(mut a, _)|
+                {
+                    a.Data.SetClusterNumber(NewCluster);
+                    a.WriteBack();
                 });
 
-            // Write to FAT
-            CurrentClusterChain.iter().for_each(|a|FB.SetFATEntry(*a, 0));
-            NewClusterChain.iter().zip(NewClusterChain.iter().rev().take(NewClusterChain.len() - 1).rev().chain([0x0FFFFFFF].iter())).for_each(|(This,Next)| FB.SetFATEntry(*This, *Next));
-            FB.FATSegment.borrow_mut().WriteBack();
+            // Set .. entries right
+            self.GetDirIterator(NewCluster).filter(|(a, _)| a.Data.IsDir() && !a.Data.IsDot() && !a.Data.IsDotDot()).for_each(
+                |(a, _)|
+                {
+                    self.GetDirIterator(a.Data.GetClusterNumber()).filter(|(a, _)| a.Data.IsDir() && a.Data.IsDotDot()).for_each(
+                        |(mut a, _)|
+                        {
+                            a.Data.SetClusterNumber(NewCluster);
+                            a.WriteBack();
+                        });
+                }
+            );
+        }
 
-            // Set clusters in dir entry right
-            let NewCluster = NewClusterChain[0];
-            MovedFile.Data.SetClusterNumber(NewCluster);
-            MovedFile.WriteBack();
-
-            if MovedFile.Data.IsDir()
-            {
-                // Set . entry right
-                self.GetDirIterator(NewCluster).filter(|(a, _)| a.Data.IsDir() && a.Data.IsDot()).for_each(
-                    |(mut a, _)|
-                    {
-                        a.Data.SetClusterNumber(NewCluster);
-                        a.WriteBack();
-                    });
-
-                // Set .. entries right
-                self.GetDirIterator(NewCluster).filter(|(a, _)| a.Data.IsDir() && !a.Data.IsDot() && !a.Data.IsDotDot()).for_each(
-                    |(a, _)|
-                    {
-                        self.GetDirIterator(a.Data.GetClusterNumber()).filter(|(a, _)| a.Data.IsDir() && a.Data.IsDotDot()).for_each(
-                            |(mut a, _)|
-                            {
-                                a.Data.SetClusterNumber(NewCluster);
-                                a.WriteBack();
-                            });
-                    }
-                );
-            }
-
-            return Some(NewCluster)
-        })();
-
-        self.BiggestFreeCluster = BiggestFreeCluster;
-        return Result
+        return Some(NewCluster)
     }
 
     fn MoveAllFilesToEnd(&mut self)
