@@ -1,6 +1,6 @@
 #![allow(bad_style, mismatched_lifetime_syntaxes)]
 
-use std::{cell::{Cell, RefCell}, collections::{HashMap, VecDeque}, fs::File, io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::{PathBuf}};
+use std::{cell::{Cell, RefCell}, collections::{HashMap, VecDeque}, fs::File, io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::PathBuf, process::exit};
 use bincode::{Decode, Encode, config};
 use clap::{Parser, Subcommand};
 use itertools::Itertools;
@@ -574,7 +574,11 @@ enum Command
     },
     PrintClusterUse
     {
-        PrintScale : usize
+        #[clap(long, short = 's', default_value_t = 1)]
+        PrintScale : usize,
+
+        #[clap(long, short = 'c', default_value_t = false)]
+        CompactPrint : bool
     },
     PrintDir
     {
@@ -588,11 +592,22 @@ enum Command
     PrintFilesizeSum
 }
 
+fn GracefulExit(Message: String) -> !
+{
+    eprintln!("{}", Message);
+    exit(1);
+}
+
 fn main()
 {
     let Args = fatplowApp::parse();
 
-    let OpenedFile = File::options().read(true).write(true).open(Args.FileName).unwrap();
+    let OpenedFile = match File::options().read(true).write(true).open(Args.FileName)
+    {
+        Ok(v) => v,
+        Err(e) => GracefulExit(format!("Could not open file system: {}", e))
+    };
+
     let mut FFS = FATFileSystem::new(&OpenedFile);
 
 
@@ -607,15 +622,26 @@ fn main()
                 None => eprintln!("File with start cluster {} not found.", Cluster)
             }
         },
-        Command::PrintClusterUse {PrintScale} =>
+        Command::PrintClusterUse {PrintScale, CompactPrint} =>
         {
-            let FB = FFS.GetFatBuffer();
-            let UsageString = (2u32..(FFS.FATEntryCount as u32 + 2))
-                .map(|a| FB.GetFATEntry(a) != 0)
-                .chunks(PrintScale)
-                .into_iter().map(|Chunk| if Chunk.map(|v| if v {1} else {-1}).sum::<i64>() > 0 {'O'} else {'.'}).collect::<String>();
+            let BoolToChar = |b: bool| if b {'O'} else {'.'};
 
-            print!("{}", UsageString);
+            let FB = FFS.GetFatBuffer();
+            let ClusterUseMap = (2u32..(FFS.FATEntryCount as u32 + 2))
+                .map(|a| FB.GetFATEntry(a) != 0);
+
+            if (CompactPrint)
+            {
+                ClusterUseMap.chunk_by(|a| *a).into_iter().for_each(|(v, i)| println!("{} {}", BoolToChar(v), i.count()));
+            }
+            else
+            {
+                let UsageString = ClusterUseMap
+                    .chunks(PrintScale)
+                    .into_iter().map(|Chunk| BoolToChar(Chunk.map(|v| if v {1} else {-1}).sum::<i64>() > 0)).collect::<String>();
+
+                print!("{}", UsageString);
+            }
         },
         Command::PrintDir {Cluster} =>
         {
