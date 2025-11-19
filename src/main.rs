@@ -451,17 +451,7 @@ impl<'a> FATFileSystem<'a>
         let mut NewClusters = PickedClusters.iter().filter(|a| !CurrentClusterChain.contains(a)).map(|a| *a);
 
         let NewClusterChain : Vec<u32> = (0..CurrentClusterChain.len())
-            .map(|i|
-                {
-                    if PickedClusters.contains(&CurrentClusterChain[i])
-                    {
-                        return CurrentClusterChain[i];
-                    }
-                    else
-                    {
-                        return NewClusters.next().unwrap();
-                    }
-                })
+            .map(|i| if PickedClusters.contains(&CurrentClusterChain[i]) {CurrentClusterChain[i]} else {NewClusters.next().unwrap()})
             .collect();
 
         self.BiggestFreeCluster.set(*NewClusterChain.iter().min().unwrap());
@@ -560,7 +550,7 @@ impl<'a> FATFileSystem<'a>
 fn PrintDirEntry(DirEntry : FileSegment<FATDirEntry>)
 {
     let D = &DirEntry.Data;
-    println!("{:10} {} {}", D.GetClusterNumber(), str::from_utf8(&D.Name).unwrap(), D.FileSize);
+    println!("{}{:10} {} {}", if D.IsDir() {'D'} else {' '}, D.GetClusterNumber(), str::from_utf8(&D.Name).unwrap(), D.FileSize);
 }
 
 
