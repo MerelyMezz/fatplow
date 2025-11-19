@@ -589,8 +589,7 @@ enum Command
     PrintFileClusters
     {
         Cluster : u32
-    },
-    PrintFilesizeSum
+    }
 }
 
 fn GracefulExit(Message: String) -> !
@@ -683,15 +682,6 @@ fn main()
                 FFS.GetDirIterator(Cluster).for_each(|(v,_)| PrintDirEntry(v));
             }
         },
-        Command::PrintFileClusters {Cluster} => FFS.GetFatIterator(Cluster).for_each(|a| println!("{}", a)),
-        Command::PrintFilesizeSum =>
-        {
-            let Sum : u64 = FFS.GetRecursiveDirIterator(FFS.BS.Data.RootClus)
-                .filter(|(v,_)| !v.Data.IsDir())
-                .map(|(v,_)|v.Data.FileSize as u64)
-                .sum();
-
-            println!("{}", Sum);
-        }
+        Command::PrintFileClusters {Cluster} => FFS.GetFatIterator(Cluster).for_each(|a| println!("{}", a))
     }
 }
