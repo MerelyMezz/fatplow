@@ -571,6 +571,11 @@ enum Command
         #[clap(long, short = 'c', default_value_t = 0)]
         FileCluster : u32
     },
+    PrintNextFreeCluster,
+    SetNextFreeCluster
+    {
+        NextFreeCluster : u32
+    },
     PrintClusterUse
     {
         #[clap(long, short = 's', default_value_t = 1)]
@@ -628,6 +633,12 @@ fn main()
                 }
             }
         },
+        Command::PrintNextFreeCluster => println!("{}", FFS.FSI.Data.Nxt_Free),
+        Command::SetNextFreeCluster { NextFreeCluster } =>
+        {
+            FFS.FSI.Data.Nxt_Free = NextFreeCluster;
+            FFS.FSI.WriteBack();
+        }
         Command::PrintClusterUse {PrintScale, CompactPrint} =>
         {
             let BoolToChar = |b: bool| if b {'O'} else {'.'};
