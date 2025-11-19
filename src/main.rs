@@ -405,6 +405,25 @@ impl<'a> FATFileSystem<'a>
         return FATDirIteratorRecursive { FFS: self, DirQueue : VecDeque::<u32>::new(), CurrentIterator : self.GetDirIterator(Cluster) };
     }
 
+    fn FindParentDirAndEntryIndex(&self, Cluster : u32) -> Option<(u32,u64)>
+    {
+        let FoundIndices : Vec<(u32,u64)>= self.GetRecursiveDirIterator(self.BS.Data.RootClus)
+            .filter(|(v,_)| v.Data.GetClusterNumber() == Cluster && !v.Data.IsDot() && !v.Data.IsDotDot())
+            .map(|(_,i)| i)
+            .collect();
+
+        if FoundIndices.len() == 1
+        {
+            return Some(FoundIndices[0]);
+        }
+        else if FoundIndices.len() > 1
+        {
+            eprintln!("File with cluster {} is listed more than once.", Cluster)
+        }
+
+        return None;
+    }
+
     fn MoveFileToEnd(&mut self, ParentDir : u32, EntryIndex : u64) -> Option<u32>
     {
         let mut MovedFile = self.GetDirEntry(ParentDir, EntryIndex);
@@ -592,18 +611,11 @@ fn main()
         Command::MoveAllClustersToEnd => FFS.MoveAllFilesToEnd(),
         Command::MoveFileClustersToEnd {Cluster} =>
         {
-            let FoundFiles : Vec<(u32,u64)> = FFS.GetRecursiveDirIterator(FFS.BS.Data.RootClus)
-                .filter(|(v,i)| v.Data.GetClusterNumber() == Cluster)
-                .map(|(_,i)| i)
-                .collect();
-
-            if FoundFiles.is_empty()
+            match FFS.FindParentDirAndEntryIndex(Cluster)
             {
-                eprintln!("File with start cluster {} not found.", Cluster);
-                return;
+                Some((dir,i)) => _ = FFS.MoveFileToEnd(dir, i),
+                None => eprintln!("File with start cluster {} not found.", Cluster)
             }
-
-            FoundFiles.iter().for_each(|(dir,i)| _ = FFS.MoveFileToEnd(*dir, *i));
         },
         Command::PrintClusterUse {PrintScale} =>
         {
@@ -615,7 +627,30 @@ fn main()
 
             print!("{}", UsageString);
         },
-        Command::PrintDir {Cluster} => FFS.GetDirIterator(Cluster).for_each(|(v,_)| PrintDirEntry(v)),
+        Command::PrintDir {Cluster} =>
+        {
+            if Cluster != FFS.BS.Data.RootClus
+            {
+                match FFS.FindParentDirAndEntryIndex(Cluster)
+                {
+                    Some((dir, i)) =>
+                    {
+                        if !FFS.GetDirEntry(dir, i).Data.IsDir()
+                        {
+                            eprintln!("File with cluster {} is not a directory.", Cluster);
+                            return;
+                        }
+                    },
+                    None =>
+                    {
+                        eprintln!("Directory with start cluster {} not found.", Cluster);
+                        return;
+                    }
+                }
+            }
+
+            FFS.GetDirIterator(Cluster).for_each(|(v,_)| PrintDirEntry(v));
+        },
         Command::PrintAllFiles => FFS.GetRecursiveDirIterator(FFS.BS.Data.RootClus)
             .filter(|(v,_)| !v.Data.IsDot() && !v.Data.IsDotDot())
             .for_each(|(v,_)| PrintDirEntry(v)),
