@@ -581,9 +581,11 @@ enum Command
     },
     PrintDir
     {
-        Cluster : u32
+        Cluster : u32,
+
+        #[clap(long, short = 'r', default_value_t = false)]
+        Recursive : bool
     },
-    PrintAllFiles,
     PrintFileClusters
     {
         Cluster : u32
@@ -648,7 +650,7 @@ fn main()
                 print!("{}", UsageString);
             }
         },
-        Command::PrintDir {Cluster} =>
+        Command::PrintDir {Cluster, Recursive} =>
         {
             if Cluster != FFS.BS.Data.RootClus
             {
@@ -670,11 +672,17 @@ fn main()
                 }
             }
 
-            FFS.GetDirIterator(Cluster).for_each(|(v,_)| PrintDirEntry(v));
+            if Recursive
+            {
+                FFS.GetRecursiveDirIterator(Cluster)
+                    .filter(|(v,_)| !v.Data.IsDot() && !v.Data.IsDotDot())
+                    .for_each(|(v,_)| PrintDirEntry(v))
+            }
+            else
+            {
+                FFS.GetDirIterator(Cluster).for_each(|(v,_)| PrintDirEntry(v));
+            }
         },
-        Command::PrintAllFiles => FFS.GetRecursiveDirIterator(FFS.BS.Data.RootClus)
-            .filter(|(v,_)| !v.Data.IsDot() && !v.Data.IsDotDot())
-            .for_each(|(v,_)| PrintDirEntry(v)),
         Command::PrintFileClusters {Cluster} => FFS.GetFatIterator(Cluster).for_each(|a| println!("{}", a)),
         Command::PrintFilesizeSum =>
         {
