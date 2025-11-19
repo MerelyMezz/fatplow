@@ -628,6 +628,10 @@ fn main()
 
     let mut FFS = FATFileSystem::new(&OpenedFile);
 
+    if !(FFS.BS.Data.BootSig == 0x29 && FFS.BS.Data.Sign == 0xaa55 && FFS.FSI.Data.LeadSig == 0x41615252 && FFS.FSI.Data.StrucSig == 0x61417272 && FFS.FSI.Data.TrailSig == 0xaa550000)
+    {
+        GracefulExit("Invalid FAT signature on file system".to_string());
+    }
 
     match Args.Command
     {
