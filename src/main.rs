@@ -524,7 +524,6 @@ impl<'a> FATFileSystem<'a>
             .collect();
 
         MoveJobs.sort_by_key(|(FileCluster,_,_)| *FileCluster);
-        MoveJobs.iter().for_each(|a| println!("{:?}", a));
 
         let mut ClusterRedirects = HashMap::<u32, u32>::new();
 
@@ -567,10 +566,10 @@ struct fatplowApp
 #[derive(Debug, Subcommand)]
 enum Command
 {
-    MoveAllClustersToEnd,
-    MoveFileClustersToEnd
+    MoveClustersToEnd
     {
-        Cluster : u32
+        #[clap(long, short = 'c', default_value_t = 0)]
+        FileCluster : u32
     },
     PrintClusterUse
     {
@@ -613,13 +612,19 @@ fn main()
 
     match Args.Command
     {
-        Command::MoveAllClustersToEnd => FFS.MoveAllFilesToEnd(),
-        Command::MoveFileClustersToEnd {Cluster} =>
+        Command::MoveClustersToEnd {FileCluster} =>
         {
-            match FFS.FindParentDirAndEntryIndex(Cluster)
+            if FileCluster < 2
             {
-                Some((dir,i)) => _ = FFS.MoveFileToEnd(dir, i),
-                None => eprintln!("File with start cluster {} not found.", Cluster)
+                FFS.MoveAllFilesToEnd();
+            }
+            else
+            {
+                match FFS.FindParentDirAndEntryIndex(FileCluster)
+                {
+                    Some((dir,i)) => _ = FFS.MoveFileToEnd(dir, i),
+                    None => eprintln!("File with start cluster {} not found.", FileCluster)
+                }
             }
         },
         Command::PrintClusterUse {PrintScale, CompactPrint} =>
