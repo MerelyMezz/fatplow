@@ -566,34 +566,47 @@ struct fatplowApp
 #[derive(Debug, Subcommand)]
 enum Command
 {
+    ///Move the contents of files to the end of the data storage.
     MoveClustersToEnd
     {
-        #[clap(long, short = 'c', default_value_t = 0)]
+        ///Only move the specified file.
+        #[clap(long, short = 'f', default_value_t = 0)]
         FileCluster : u32
     },
+    ///Print the Nxt_Free hint. It helps find free clusters faster.
     PrintNextFreeCluster,
+    ///Set the Nxt_Free hint.
     SetNextFreeCluster
     {
+        ///New value for Nxt_Free
         NextFreeCluster : u32
     },
+    ///Displays cluster usage. 'O' is a used cluster, '.' a free one.
     PrintClusterUse
     {
+        ///Condense multiple clusters into one for display.
         #[clap(long, short = 's', default_value_t = 1)]
         PrintScale : usize,
 
+        ///Show cluster use numerically as a table.
         #[clap(long, short = 'c', default_value_t = false)]
         CompactPrint : bool
     },
+    ///Print files in a directory, with its cluster number and size.
     PrintDir
     {
-        Cluster : u32,
+        ///Cluster of directory to print.
+        DirCluster : u32,
 
+        ///Print contents of all subdirectories too.
         #[clap(long, short = 'r', default_value_t = false)]
         Recursive : bool
     },
+    ///Print the cluster chain used to store a particular file.
     PrintFileClusters
     {
-        Cluster : u32
+        ///First cluster of the chain to print.
+        StartCluster : u32
     }
 }
 
@@ -657,26 +670,26 @@ fn main()
                     .chunks(PrintScale)
                     .into_iter().map(|Chunk| BoolToChar(Chunk.map(|v| if v {1} else {-1}).sum::<i64>() > 0)).collect::<String>();
 
-                print!("{}", UsageString);
+                println!("{}", UsageString);
             }
         },
-        Command::PrintDir {Cluster, Recursive} =>
+        Command::PrintDir {DirCluster, Recursive} =>
         {
-            if Cluster != FFS.BS.Data.RootClus
+            if DirCluster != FFS.BS.Data.RootClus
             {
-                match FFS.FindParentDirAndEntryIndex(Cluster)
+                match FFS.FindParentDirAndEntryIndex(DirCluster)
                 {
                     Some((dir, i)) =>
                     {
                         if !FFS.GetDirEntry(dir, i).Data.IsDir()
                         {
-                            eprintln!("File with cluster {} is not a directory.", Cluster);
+                            eprintln!("File with cluster {} is not a directory.", DirCluster);
                             return;
                         }
                     },
                     None =>
                     {
-                        eprintln!("Directory with start cluster {} not found.", Cluster);
+                        eprintln!("Directory with start cluster {} not found.", DirCluster);
                         return;
                     }
                 }
@@ -684,15 +697,15 @@ fn main()
 
             if Recursive
             {
-                FFS.GetRecursiveDirIterator(Cluster)
+                FFS.GetRecursiveDirIterator(DirCluster)
                     .filter(|(v,_)| !v.Data.IsDot() && !v.Data.IsDotDot())
                     .for_each(|(v,_)| PrintDirEntry(v))
             }
             else
             {
-                FFS.GetDirIterator(Cluster).for_each(|(v,_)| PrintDirEntry(v));
+                FFS.GetDirIterator(DirCluster).for_each(|(v,_)| PrintDirEntry(v));
             }
         },
-        Command::PrintFileClusters {Cluster} => FFS.GetFatIterator(Cluster).for_each(|a| println!("{}", a))
+        Command::PrintFileClusters {StartCluster} => FFS.GetFatIterator(StartCluster).for_each(|a| println!("{}", a))
     }
 }
