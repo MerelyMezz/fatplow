@@ -1,6 +1,7 @@
 #![allow(bad_style, mismatched_lifetime_syntaxes)]
 
-use std::{cell::{Cell, RefCell}, collections::{HashMap, VecDeque}, fs::File, io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::PathBuf, process::exit};
+use core::fmt;
+use std::{cell::{Cell, RefCell}, collections::{HashMap, VecDeque}, fmt::Formatter, fs::File, io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::PathBuf, process::exit};
 use bincode::{Decode, Encode, config};
 use clap::{Parser, Subcommand};
 use itertools::Itertools;
@@ -16,17 +17,21 @@ struct FATBootSector
     SecPerClus : u8,
     RsvdSecCnt : u16,
     NumFATs : u8,
-    _pad1 : [u8; 15],
+    _pad1 : [u8; 2],
+    TotSec16 : u16,
+    _pad2 : [u8; 1],
+    FATSz16 : u16,
+    _pad3 : [u8; 8],
     TotSec32 : u32,
 
     // FAT32 fields
     FATSz32 : u32,
-    _pad2 : [u8;4],
+    _pad4 : [u8;4],
     RootClus : u32,
     FSInfo : u16,
-    _pad3 : [u8;16],
+    _pad5 : [u8;16],
     BootSig : u8,
-    _pad4 : [u8; 443],
+    _pad6 : [u8; 443],
     Sign : u16
     // size 512 bytes
 }
@@ -321,6 +326,29 @@ impl<'a, DataType: Encode + Decode<()>> FileSegment<'a, DataType>
     }
 }
 
+#[derive(Debug)]
+enum FATCreateError
+{
+    InvalidBSSignature,
+    InvalidFSISignature,
+    NotFAT32,
+    NotEnoughClusters
+}
+
+impl fmt::Display for FATCreateError
+{
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result
+    {
+        match *self
+        {
+            Self::InvalidBSSignature => write!(f, "Invalid boot sector signature on file system"),
+            Self::InvalidFSISignature => write!(f, "Invalid FileSystemInfo signature on file system"),
+            Self::NotFAT32 => write!(f, "File system is probably FAT16 or FAT12, but not FAT32."),
+            Self::NotEnoughClusters => write!(f, "File system has less than 65526 clusters. Too few for valid FAT32")
+        }
+    }
+}
+
 struct FATFileSystem<'a>
 {
     OpenedFile : &'a File,
@@ -339,24 +367,46 @@ struct FATFileSystem<'a>
 
 const FATBufferSize : usize = 128;
 
+
 impl<'a> FATFileSystem<'a>
 {
-    fn new(OpenedFile : &'a File) -> Self
+    fn new(OpenedFile : &'a File) -> Result<Self, FATCreateError>
     {
         let BS: FileSegment<'_, FATBootSector> = FileSegment::<FATBootSector>::new(0, FATBootSectorSize, &OpenedFile);
-        let FSIAddress = (BS.Data.FSInfo * BS.Data.BytsPerSec) as u64;
-        let FSI = FileSegment::<FATFileSystemInfo>::new(FSIAddress, FATFileSystemInfoSize, &OpenedFile);
+
+        if BS.Data.FATSz16 != 0 || BS.Data.TotSec16 != 0
+        {
+            return Err(FATCreateError::NotFAT32);
+        }
 
         let BytesPerCluster = (BS.Data.SecPerClus as u16 * BS.Data.BytsPerSec) as u64;
         let FATStartByte = (BS.Data.RsvdSecCnt * BS.Data.BytsPerSec) as u64;
         let DataStartByte = FATStartByte + BS.Data.NumFATs as u64 * BS.Data.FATSz32 as u64 * BS.Data.BytsPerSec as u64;
-
         let FATEntryCount = (((BS.Data.TotSec32 as u64 * BS.Data.BytsPerSec as u64) - DataStartByte) / BytesPerCluster) as u32;
-        let BiggestFreeCluster = Cell::new(FATEntryCount + 2 - 1);
 
+        // Validate, that we are working with a FAT32 system
+        if FATEntryCount < 65526
+        {
+            return Err(FATCreateError::NotEnoughClusters);
+        }
+
+        if !(BS.Data.BootSig == 0x29 && BS.Data.Sign == 0xaa55)
+        {
+            return Err(FATCreateError::InvalidBSSignature);
+        }
+
+        let FSIAddress = (BS.Data.FSInfo * BS.Data.BytsPerSec) as u64;
+        let FSI = FileSegment::<FATFileSystemInfo>::new(FSIAddress, FATFileSystemInfoSize, &OpenedFile);
+
+        if !(FSI.Data.LeadSig == 0x41615252 && FSI.Data.StrucSig == 0x61417272 && FSI.Data.TrailSig == 0xaa550000)
+        {
+            return Err(FATCreateError::InvalidFSISignature);
+        }
+
+        let BiggestFreeCluster = Cell::new(FATEntryCount + 2 - 1);
         let DirEntriesPerCluster = BytesPerCluster / FATDirEntrySize;
 
-        return FATFileSystem
+        return Ok(FATFileSystem
         {
             OpenedFile,
             BS,
@@ -367,7 +417,7 @@ impl<'a> FATFileSystem<'a>
             FATEntryCount,
             BiggestFreeCluster,
             DirEntriesPerCluster,
-        };
+        });
     }
 
     fn GetClusterStartByte(&self, Cluster : u32) -> u64
@@ -481,7 +531,14 @@ impl<'a> FATFileSystem<'a>
 
         // Write to FAT
         CurrentClusterChain.iter().for_each(|a|FB.SetFATEntry(*a, 0));
-        NewClusterChain.iter().zip(NewClusterChain.iter().rev().take(NewClusterChain.len() - 1).rev().chain([0x0FFFFFFF].iter())).for_each(|(This,Next)| FB.SetFATEntry(*This, *Next));
+        NewClusterChain.iter()
+            .zip(NewClusterChain.iter()
+                .rev()
+                .take(NewClusterChain.len() - 1)
+                .rev()
+                .chain([0x0FFFFFFF].iter()))
+            .for_each(|(This,Next)| FB.SetFATEntry(*This, *Next));
+
         FB.FATSegment.borrow_mut().WriteBack();
 
         // Set clusters in dir entry right
@@ -626,12 +683,11 @@ fn main()
         Err(e) => GracefulExit(format!("Could not open file system: {}", e))
     };
 
-    let mut FFS = FATFileSystem::new(&OpenedFile);
-
-    if !(FFS.BS.Data.BootSig == 0x29 && FFS.BS.Data.Sign == 0xaa55 && FFS.FSI.Data.LeadSig == 0x41615252 && FFS.FSI.Data.StrucSig == 0x61417272 && FFS.FSI.Data.TrailSig == 0xaa550000)
+    let mut FFS = match FATFileSystem::new(&OpenedFile)
     {
-        GracefulExit("Invalid FAT signature on file system".to_string());
-    }
+        Ok(v) => v,
+        Err(e) => GracefulExit(format!("Failed to open file as FAT32: {}", e))
+    };
 
     match Args.Command
     {
@@ -664,7 +720,7 @@ fn main()
             let ClusterUseMap = (2u32..(FFS.FATEntryCount as u32 + 2))
                 .map(|a| FB.GetFATEntry(a) != 0);
 
-            if (CompactPrint)
+            if CompactPrint
             {
                 ClusterUseMap.chunk_by(|a| *a).into_iter().for_each(|(v, i)| println!("{} {}", BoolToChar(v), i.count()));
             }
