@@ -227,7 +227,11 @@ impl fmt::Display for FATInvalidAccessError
 {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result
     {
-        return write!(f, "Attempted to access a FAT entry larger than the maximum");
+        match self
+        {
+            FATInvalidAccessError::InvalidFATEntry => write!(f, "Attempted to access a FAT entry larger than the maximum."),
+            FATInvalidAccessError::InvalidDirectoryEntryIndex => write!(f, "Directory Entry Index exceeds length granted by cluster chain.")
+        }
     }
 }
 
