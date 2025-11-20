@@ -176,7 +176,7 @@ struct FATDirIteratorRecursive<'a>
 
 impl<'a> Iterator for FATDirIteratorRecursive<'a>
 {
-    type Item = (FileSegment<'a, FATDirEntry>, (u32, u64));
+    type Item = Result<(FileSegment<'a, FATDirEntry>, (u32, u64)), FATInvalidAccess>;
 
     fn next(&mut self) -> Option<Self::Item>
     {
@@ -193,18 +193,41 @@ impl<'a> Iterator for FATDirIteratorRecursive<'a>
                         self.DirQueue.push_back(v.Data.GetClusterNumber());
                     }
 
-                    return Some((v,i));
+                    return Some(Ok((v,i)));
                 },
                 None =>
                 {
                     match self.DirQueue.pop_front()
                     {
-                        Some(v) => self.CurrentIterator = self.FFS.GetDirIterator(v),
+                        Some(v) => self.CurrentIterator = match self.FFS.GetDirIterator(v)
+                            {
+                                Ok(v) => v,
+                                Err(e) =>
+                                {
+                                    self.DirQueue.clear();
+                                    return Some(Err(e))
+                                }
+                            },
                         None => return None
                     }
                 }
             }
         }
+    }
+}
+
+#[derive(Debug)]
+enum FATInvalidAccess
+{
+    InvalidFATEntry,
+    InvalidDirectoryEntryIndex
+}
+
+impl fmt::Display for FATInvalidAccess
+{
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result
+    {
+        return write!(f, "Attempted to access a FAT entry larger than the maximum");
     }
 }
 
@@ -217,30 +240,48 @@ struct FATBuffer<'a>
 
 impl<'a> FATBuffer<'a>
 {
-    fn GetFATEntry(&self, FATEntry : u32) -> u32
+    fn GetFATEntry(&self, FATEntry : u32) -> Result<u32, FATInvalidAccess>
     {
-        self.EnsureFATEntryIsBuffered(FATEntry);
-        return self.FATSegment.borrow().Data[(FATEntry - self.BufferedFATEntry.get()) as usize] & 0x0FFFFFFF;
+        return match self.EnsureFATEntryIsBuffered(FATEntry)
+        {
+            Ok(_) => Ok(self.FATSegment.borrow().Data[(FATEntry - self.BufferedFATEntry.get()) as usize] & 0x0FFFFFFF),
+            Err(e) => Err(e)
+        }
     }
 
-    fn SetFATEntry(&mut self, FATEntry : u32, Value : u32)
+    fn SetFATEntry(&mut self, FATEntry : u32, Value : u32) -> Result<(), FATInvalidAccess>
     {
-        self.EnsureFATEntryIsBuffered(FATEntry);
-        let Index = (FATEntry - self.BufferedFATEntry.get()) as usize;
-        self.FATSegment.borrow_mut().Data[Index] &= 0xF0000000;
-        self.FATSegment.borrow_mut().Data[Index] |= Value & 0x0FFFFFFF;
+        match self.EnsureFATEntryIsBuffered(FATEntry)
+        {
+            Ok(_) =>
+            {
+                let Index = (FATEntry - self.BufferedFATEntry.get()) as usize;
+                self.FATSegment.borrow_mut().Data[Index] &= 0xF0000000;
+                self.FATSegment.borrow_mut().Data[Index] |= Value & 0x0FFFFFFF;
+
+                return Ok(());
+            }
+            Err(e) => return Err(e)
+        }
     }
 
-    fn EnsureFATEntryIsBuffered(&self, FATEntry : u32)
+    fn EnsureFATEntryIsBuffered(&self, FATEntry : u32) -> Result<(), FATInvalidAccess>
     {
+        if !self.FFS.IsValidCluster(FATEntry)
+        {
+            return Err(FATInvalidAccess::InvalidFATEntry);
+        }
+
         if FATEntry >= self.BufferedFATEntry.get() && FATEntry - self.BufferedFATEntry.get() < FATBufferSize as u32
         {
-            return;
+            return Ok(());
         }
 
         self.BufferedFATEntry.set( FATEntry - (FATEntry % FATBufferSize as u32));
         self.FATSegment.borrow_mut().WriteBack();
         *self.FATSegment.borrow_mut() = FileSegment::<[u32;FATBufferSize]>::new(self.FFS.FATStartByte + self.BufferedFATEntry.get() as u64*4, FATBufferSize as u64 * 4, self.FFS.OpenedFile);
+
+        return Ok(());
     }
 }
 
@@ -254,7 +295,7 @@ struct FATIterator<'a>
 
 impl<'a> Iterator for FATIterator<'a>
 {
-    type Item = u32;
+    type Item = Result<u32, FATInvalidAccess>;
 
     fn next(&mut self) -> Option<Self::Item>
     {
@@ -281,8 +322,19 @@ impl<'a> Iterator for FATIterator<'a>
             return None;
         }
 
-        self.CurrentEntry = self.FB.GetFATEntry(self.CurrentEntry);
-        return Some(ReturnItem);
+        match self.FB.GetFATEntry(self.CurrentEntry)
+        {
+            Ok(v) =>
+            {
+                self.CurrentEntry = v;
+                return Some(Ok(ReturnItem));
+            }
+            Err(e) =>
+            {
+                self.EndReached = true;
+                return Some(Err(e))
+            }
+        }
     }
 }
 
@@ -393,7 +445,6 @@ impl<'a> FATFileSystem<'a>
         let DataStartByte = FATStartByte + BS.Data.NumFATs as u64 * BS.Data.FATSz32 as u64 * BS.Data.BytsPerSec as u64;
         let FATEntryCount = (((BS.Data.TotSec32 as u64 * BS.Data.BytsPerSec as u64) - DataStartByte) / BytesPerCluster) as u32;
 
-        // Validate, that we are working with a FAT32 system
         if FATEntryCount < 65526
         {
             return Err(FATCreateError::NotEnoughClusters);
@@ -434,6 +485,11 @@ impl<'a> FATFileSystem<'a>
         });
     }
 
+    fn IsValidCluster(&self, Cluster : u32) -> bool
+    {
+        return Cluster <= self.FATEntryCount + 2 && Cluster >= 2;
+    }
+
     fn GetClusterStartByte(&self, Cluster : u32) -> u64
     {
         return self.DataStartByte + (Cluster as u64 - 2) * self.BytesPerCluster;
@@ -449,62 +505,95 @@ impl<'a> FATFileSystem<'a>
         return FATIterator { FB: self.GetFatBuffer(), StartEntry, CurrentEntry: StartEntry, EndReached : false };
     }
 
-    fn GetDirEntry(&self, Cluster : u32, EntryIndex : u64) -> FileSegment<FATDirEntry>
+    fn GetDirEntry(&self, Cluster : u32, EntryIndex : u64) -> Result<FileSegment<FATDirEntry>, FATInvalidAccess>
     {
         //This is basically the same as the iterator code, except that we don't cache the fat chain
         let ClusterIndex = (EntryIndex / self.DirEntriesPerCluster) as usize;
-        let ClusterPostiion = self.GetClusterStartByte(self.GetFatIterator(Cluster).nth(ClusterIndex).unwrap());
+        let ClusterPostiion = match self.GetFatIterator(Cluster).nth(ClusterIndex)
+        {
+            Some(Ok(v)) => self.GetClusterStartByte(v),
+            Some(Err(e)) => return Err(e),
+            None => return Err(FATInvalidAccess::InvalidDirectoryEntryIndex)
+        };
+
         let EntryOffset = (EntryIndex % self.DirEntriesPerCluster) * FATDirEntrySize;
 
-        return FileSegment::<FATDirEntry>::new(ClusterPostiion + EntryOffset, FATDirEntrySize, self.OpenedFile);
+        return Ok(FileSegment::<FATDirEntry>::new(ClusterPostiion + EntryOffset, FATDirEntrySize, self.OpenedFile));
     }
 
-    fn GetDirIterator(&self, StartCluster : u32) -> FATDirIterator
+    fn GetDirIterator(&self, StartCluster : u32) -> Result<FATDirIterator, FATInvalidAccess>
     {
-        return FATDirIterator { FFS : self, ClusterChain: self.GetFatIterator(StartCluster).collect(), EntryIndex: 0, EndReached : false}
+        match self.GetFatIterator(StartCluster).collect()
+        {
+            Ok(v) => Ok(FATDirIterator { FFS : self, ClusterChain: v, EntryIndex: 0, EndReached : false}),
+            Err(e) => Err(e)
+        }
     }
 
-    fn GetRecursiveDirIterator(&self, Cluster : u32) -> FATDirIteratorRecursive
+    fn GetRecursiveDirIterator(&self, Cluster : u32) -> Result<FATDirIteratorRecursive, FATInvalidAccess>
     {
-        return FATDirIteratorRecursive { FFS: self, DirQueue : VecDeque::<u32>::new(), CurrentIterator : self.GetDirIterator(Cluster) };
+        match self.GetDirIterator(Cluster)
+        {
+            Ok(v) => Ok(FATDirIteratorRecursive { FFS: self, DirQueue : VecDeque::<u32>::new(), CurrentIterator : v }),
+            Err(e) => Err(e)
+        }
     }
 
-    fn FindParentDirAndEntryIndex(&self, Cluster : u32) -> Option<(u32,u64)>
+    fn FindParentDirAndEntryIndex(&self, Cluster : u32) -> Result<Option<(u32,u64)>, FATInvalidAccess>
     {
-        let FoundIndices : Vec<(u32,u64)>= self.GetRecursiveDirIterator(self.BS.Data.RootClus)
-            .filter(|(v,_)| v.Data.GetClusterNumber() == Cluster && !v.Data.IsDot() && !v.Data.IsDotDot())
-            .map(|(_,i)| i)
-            .collect();
+        let DirIteratorRecursive = match self.GetRecursiveDirIterator(self.BS.Data.RootClus)
+        {
+            Ok(v) => v,
+            Err(e) => return Err(e)
+        };
+
+        let FoundIndices : Vec<(u32,u64)> = match DirIteratorRecursive
+            .filter_ok(|(v,_)| v.Data.GetClusterNumber() == Cluster && !v.Data.IsDot() && !v.Data.IsDotDot())
+            .map_ok(|(_,i)| i)
+            .collect()
+        {
+            Ok(v) => v,
+            Err(e) => return Err(e)
+        };
 
         if FoundIndices.len() == 1
         {
-            return Some(FoundIndices[0]);
+            return Ok(Some(FoundIndices[0]));
         }
         else if FoundIndices.len() > 1
         {
             eprintln!("File with cluster {} is listed more than once.", Cluster)
         }
 
-        return None;
+        return Ok(None);
     }
 
-    fn MoveFileToEnd(&mut self, ParentDir : u32, EntryIndex : u64) -> Option<u32>
+    fn MoveFileToEnd(&mut self, ParentDir : u32, EntryIndex : u64) -> Result<Option<u32>, FATInvalidAccess>
     {
-        let mut MovedFile = self.GetDirEntry(ParentDir, EntryIndex);
+        let mut MovedFile = match self.GetDirEntry(ParentDir, EntryIndex)
+        {
+            Ok(v) => v,
+            Err(e) => return Err(e)
+        };
 
         let mut FB = self.GetFatBuffer();
 
         //Figure out the new cluster chain to move the file to
-        let CurrentClusterChain : Vec<u32> = self.GetFatIterator(MovedFile.Data.GetClusterNumber()).collect();
+        let CurrentClusterChain : Vec<u32> = match self.GetFatIterator(MovedFile.Data.GetClusterNumber()).collect()
+        {
+            Ok(v) => v,
+            Err(e) => return Err(e)
+        };
+
         let FreeClusters : Vec<u32> =
         (2u32..=self.BiggestFreeCluster.get()).rev()
-            .filter(|a| FB.GetFATEntry(*a) == 0)
+            .filter(|a| FB.GetFATEntry(*a).unwrap() == 0)
             .take(CurrentClusterChain.len())
             .collect();
 
         if FreeClusters.len() == 0
         {
-            return None;
+            return Ok(None);
         }
 
         //Pick the highest clusters from either set, and put them into one chain
@@ -522,7 +611,7 @@ impl<'a> FATFileSystem<'a>
 
         if NewClusterChain == CurrentClusterChain
         {
-            return None;
+            return Ok(None);
         }
 
         // Copy Data
@@ -536,22 +625,22 @@ impl<'a> FATFileSystem<'a>
             {
                 if CurrentClusterChain[i] == NewClusterChain[i] {return;}
 
-                R.seek(SeekFrom::Start(self.GetClusterStartByte(CurrentClusterChain[i])));
-                R.read(&mut DataBuffer);
+                R.seek(SeekFrom::Start(self.GetClusterStartByte(CurrentClusterChain[i]))).unwrap();
+                R.read(&mut DataBuffer).unwrap();
 
-                W.seek(SeekFrom::Start(self.GetClusterStartByte(NewClusterChain[i])));
-                W.write(&DataBuffer);
+                W.seek(SeekFrom::Start(self.GetClusterStartByte(NewClusterChain[i]))).unwrap();
+                W.write(&DataBuffer).unwrap();
             });
 
         // Write to FAT
-        CurrentClusterChain.iter().for_each(|a|FB.SetFATEntry(*a, 0));
+        CurrentClusterChain.iter().for_each(|a|FB.SetFATEntry(*a, 0).unwrap());
         NewClusterChain.iter()
             .zip(NewClusterChain.iter()
                 .rev()
                 .take(NewClusterChain.len() - 1)
                 .rev()
                 .chain([0x0FFFFFFF].iter()))
-            .for_each(|(This,Next)| FB.SetFATEntry(*This, *Next));
+            .for_each(|(This,Next)| FB.SetFATEntry(*This, *Next).unwrap());
 
         FB.FATSegment.borrow_mut().WriteBack();
 
@@ -563,7 +652,7 @@ impl<'a> FATFileSystem<'a>
         if MovedFile.Data.IsDir()
         {
             // Set . entry right
-            self.GetDirIterator(NewCluster).filter(|(a, _)| a.Data.IsDir() && a.Data.IsDot()).for_each(
+            self.GetDirIterator(NewCluster).unwrap().filter(|(a, _)| a.Data.IsDir() && a.Data.IsDot()).for_each(
                 |(mut a, _)|
                 {
                     a.Data.SetClusterNumber(NewCluster);
@@ -571,10 +660,10 @@ impl<'a> FATFileSystem<'a>
                 });
 
             // Set .. entries right
-            self.GetDirIterator(NewCluster).filter(|(a, _)| a.Data.IsDir() && !a.Data.IsDot() && !a.Data.IsDotDot()).for_each(
+            self.GetDirIterator(NewCluster).unwrap().filter(|(a, _)| a.Data.IsDir() && !a.Data.IsDot() && !a.Data.IsDotDot()).for_each(
                 |(a, _)|
                 {
-                    self.GetDirIterator(a.Data.GetClusterNumber()).filter(|(a, _)| a.Data.IsDir() && a.Data.IsDotDot()).for_each(
+                    self.GetDirIterator(a.Data.GetClusterNumber()).unwrap().filter(|(a, _)| a.Data.IsDir() && a.Data.IsDotDot()).for_each(
                         |(mut a, _)|
                         {
                             a.Data.SetClusterNumber(NewCluster);
@@ -584,22 +673,26 @@ impl<'a> FATFileSystem<'a>
             );
         }
 
-        return Some(NewCluster)
+        return Ok(Some(NewCluster))
     }
 
-    fn MoveAllFilesToEnd(&mut self)
+    fn MoveAllFilesToEnd(&mut self) -> Result<(), FATInvalidAccess>
     {
-        let mut MoveJobs : Vec<(u32, u32, u64)> = self.GetRecursiveDirIterator(self.BS.Data.RootClus)
-            .filter(|(v, _)| v.Data.GetClusterNumber() != 0 && !v.Data.IsDot() && !v.Data.IsDotDot())
-            .map(|(v,(Cluster,EntryIndex))| (v.Data.GetClusterNumber(), Cluster, EntryIndex))
-            .collect();
+        let mut MoveJobs : Vec<(u32, u32, u64)> = match self.GetRecursiveDirIterator(self.BS.Data.RootClus).unwrap()
+            .filter_ok(|(v, _)| v.Data.GetClusterNumber() != 0 && !v.Data.IsDot() && !v.Data.IsDotDot())
+            .map_ok(|(v,(Cluster,EntryIndex))| (v.Data.GetClusterNumber(), Cluster, EntryIndex))
+            .collect()
+        {
+            Ok(v) => v,
+            Err(e) => return Err(e)
+        };
 
         MoveJobs.sort_by_key(|(FileCluster,_,_)| *FileCluster);
 
         let mut ClusterRedirects = HashMap::<u32, u32>::new();
 
-        MoveJobs.iter().for_each(
-            |(MovedCluster, ParentDir, EntryIndex)|
+        match MoveJobs.iter().map(
+            |(MovedCluster, ParentDir, EntryIndex)| -> Result<(), FATInvalidAccess>
             {
                 let RealParentDir = match ClusterRedirects.get(ParentDir)
                 {
@@ -609,15 +702,24 @@ impl<'a> FATFileSystem<'a>
 
                 match self.MoveFileToEnd(*RealParentDir, *EntryIndex)
                 {
-                    Some(v) => _ = ClusterRedirects.insert(*MovedCluster, v),
-                    None => ()
+                    Ok(Some(v)) => _ = ClusterRedirects.insert(*MovedCluster, v),
+                    Ok(None) => (),
+                    Err(e) => return Err(e)
                 }
-            });
+
+                return Ok(());
+            }).collect::<Result<(), FATInvalidAccess>>()
+        {
+            Ok(_) => (),
+            Err(e) => return Err(e)
+        }
+
+        return Ok(());
     }
 
 }
 
-fn PrintDirEntry(DirEntry : FileSegment<FATDirEntry>)
+fn PrintDirEntry(DirEntry : &FileSegment<FATDirEntry>)
 {
     let D = &DirEntry.Data;
     println!("{}{:10} {} {}", if D.IsDir() {'D'} else {' '}, D.GetClusterNumber(), str::from_utf8(&D.Name).unwrap(), D.FileSize);
@@ -709,14 +811,23 @@ fn main()
         {
             if FileCluster < 2
             {
-                FFS.MoveAllFilesToEnd();
+                match FFS.MoveAllFilesToEnd()
+                {
+                    Ok(()) => (),
+                    Err(e) => GracefulExit(format!("Error while moving clusters: {}", e))
+                }
             }
             else
             {
                 match FFS.FindParentDirAndEntryIndex(FileCluster)
                 {
-                    Some((dir,i)) => _ = FFS.MoveFileToEnd(dir, i),
-                    None => eprintln!("File with start cluster {} not found.", FileCluster)
+                    Ok(Some((dir,i))) => match FFS.MoveFileToEnd(dir, i)
+                    {
+                        Ok(_) => (),
+                        Err(e) => GracefulExit(format!("Error while moving clusters: {}", e))
+                    },
+                    Ok(None) => eprintln!("File with start cluster {} not found.", FileCluster),
+                    Err(e) => GracefulExit(format!("Error while searching for cluster {}. {}", FileCluster, e))
                 }
             }
         },
@@ -732,7 +843,7 @@ fn main()
 
             let FB = FFS.GetFatBuffer();
             let ClusterUseMap = (2u32..(FFS.FATEntryCount as u32 + 2))
-                .map(|a| FB.GetFATEntry(a) != 0);
+                .map(|a| FB.GetFATEntry(a).unwrap() != 0);
 
             if CompactPrint
             {
@@ -749,37 +860,71 @@ fn main()
         },
         Command::PrintDir {DirCluster, Recursive} =>
         {
+            if !FFS.IsValidCluster(DirCluster)
+            {
+                GracefulExit(format!("Invalid Cluster {}.", DirCluster));
+            }
+
             if DirCluster != FFS.BS.Data.RootClus
             {
                 match FFS.FindParentDirAndEntryIndex(DirCluster)
                 {
-                    Some((dir, i)) =>
+                    Ok(Some((dir, i))) =>
                     {
-                        if !FFS.GetDirEntry(dir, i).Data.IsDir()
+                        if !FFS.GetDirEntry(dir, i).unwrap().Data.IsDir()
                         {
                             eprintln!("File with cluster {} is not a directory.", DirCluster);
                             return;
                         }
                     },
-                    None =>
+                    Ok(None) =>
                     {
                         eprintln!("Directory with start cluster {} not found.", DirCluster);
                         return;
                     }
+                    Err(e) => GracefulExit(format!("Error while searching for cluster {}. {}", DirCluster, e))
                 }
             }
 
             if Recursive
             {
-                FFS.GetRecursiveDirIterator(DirCluster)
-                    .filter(|(v,_)| !v.Data.IsDot() && !v.Data.IsDotDot())
-                    .for_each(|(v,_)| PrintDirEntry(v))
+                let DirIteratorRecursive = match FFS.GetRecursiveDirIterator(DirCluster)
+                {
+                    Ok(v) => v,
+                    Err(_) => GracefulExit(format!("{}", "Error while initializing iterator"))
+                };
+
+                match DirIteratorRecursive.filter(
+                    |v|
+                    {
+                        match v
+                        {
+                            Ok((v,_)) => !v.Data.IsDot() && !v.Data.IsDotDot(),
+                            Err(_) => true
+                        }
+                    })
+                    .collect::<Result<Vec<(FileSegment<FATDirEntry>, (u32, u64))>, FATInvalidAccess>>()
+                {
+                    Ok(v) => v.iter().for_each(|(v,_)| PrintDirEntry(v)),
+                    Err(_) => GracefulExit(format!("{}", "Error while iterating directories"))
+                }
             }
             else
             {
-                FFS.GetDirIterator(DirCluster).for_each(|(v,_)| PrintDirEntry(v));
+                match FFS.GetDirIterator(DirCluster)
+                {
+                    Ok(v) => v.for_each(|(v,_)| PrintDirEntry(&v)),
+                    Err(e) => GracefulExit(format!("{}", "Error while iterating directories"))
+                }
             }
         },
-        Command::PrintFileClusters {StartCluster} => FFS.GetFatIterator(StartCluster).for_each(|a| println!("{}", a))
+        Command::PrintFileClusters {StartCluster} =>
+        {
+            match FFS.GetFatIterator(StartCluster).collect::<Result<Vec<u32>, FATInvalidAccess>>()
+            {
+                Ok(v) => v.iter().for_each(|a| println!("{}", a)),
+                Err(_) => GracefulExit(format!("{}", "Encountered invalid FAT entries while following the cluster chain."))
+            }
+        }
     }
 }
