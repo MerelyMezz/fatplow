@@ -1,7 +1,7 @@
 #![allow(bad_style, mismatched_lifetime_syntaxes)]
 
 use core::fmt;
-use std::{cell::{Cell, RefCell}, collections::{HashMap, VecDeque}, fmt::Formatter, fs::File, io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::PathBuf, process::exit};
+use std::{cell::{Cell, RefCell}, collections::{HashMap, VecDeque}, fmt::Formatter, fs::File, io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write}, os::unix::fs::MetadataExt, path::PathBuf, process::exit};
 use bincode::{Decode, Encode, config};
 use clap::{Parser, Subcommand};
 use itertools::Itertools;
@@ -329,6 +329,8 @@ impl<'a, DataType: Encode + Decode<()>> FileSegment<'a, DataType>
 #[derive(Debug)]
 enum FATCreateError
 {
+    TooSmallToLoadBS,
+    TooSmallAccordingToTotSec32,
     InvalidBSSignature,
     InvalidFSISignature,
     NotFAT32,
@@ -341,10 +343,12 @@ impl fmt::Display for FATCreateError
     {
         match *self
         {
-            Self::InvalidBSSignature => write!(f, "Invalid boot sector signature on file system"),
-            Self::InvalidFSISignature => write!(f, "Invalid FileSystemInfo signature on file system"),
+            Self::TooSmallToLoadBS => write!(f, "File too small to contain valid boot sector."),
+            Self::TooSmallAccordingToTotSec32 => write!(f, "File is too small for the amount of sectors it reports."),
+            Self::InvalidBSSignature => write!(f, "Invalid boot sector signature on file system."),
+            Self::InvalidFSISignature => write!(f, "Invalid FileSystemInfo signature on file system."),
             Self::NotFAT32 => write!(f, "File system is probably FAT16 or FAT12, but not FAT32."),
-            Self::NotEnoughClusters => write!(f, "File system has less than 65526 clusters. Too few for valid FAT32")
+            Self::NotEnoughClusters => write!(f, "File system has less than 65526 clusters. Too few for valid FAT32.")
         }
     }
 }
@@ -372,6 +376,11 @@ impl<'a> FATFileSystem<'a>
 {
     fn new(OpenedFile : &'a File) -> Result<Self, FATCreateError>
     {
+        if OpenedFile.metadata().unwrap().size() < FATBootSectorSize
+        {
+            return Err(FATCreateError::TooSmallToLoadBS);
+        }
+
         let BS: FileSegment<'_, FATBootSector> = FileSegment::<FATBootSector>::new(0, FATBootSectorSize, &OpenedFile);
 
         if BS.Data.FATSz16 != 0 || BS.Data.TotSec16 != 0
@@ -393,6 +402,11 @@ impl<'a> FATFileSystem<'a>
         if !(BS.Data.BootSig == 0x29 && BS.Data.Sign == 0xaa55)
         {
             return Err(FATCreateError::InvalidBSSignature);
+        }
+
+        if OpenedFile.metadata().unwrap().size() < (BS.Data.TotSec32 as u64 * BS.Data.BytsPerSec as u64)
+        {
+            return Err(FATCreateError::TooSmallAccordingToTotSec32);
         }
 
         let FSIAddress = (BS.Data.FSInfo * BS.Data.BytsPerSec) as u64;
