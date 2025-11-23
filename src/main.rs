@@ -569,6 +569,11 @@ impl<'a> FATFileSystem<'a>
         //Figure out the new cluster chain to move the file to
         let CurrentClusterChain = self.GetFatIterator(MovedFile.Data.GetClusterNumber()).collect::<Result<Vec<u32>, FATInvalidAccessError>>()?;
 
+        if CurrentClusterChain.iter().all(|i| *i > self.BiggestFreeCluster.get())
+        {
+            return Ok(None);
+        }
+
         let FreeClusters : Vec<u32> =
         (2u32..=self.BiggestFreeCluster.get()).rev()
             .filter(|a| FB.GetFATEntry(*a).unwrap() == 0)
@@ -703,7 +708,7 @@ fn PrintDirEntry(DirEntry : &FileSegment<FATDirEntry>)
 
 
 #[derive(Debug, Parser)]
-#[clap(name = "fatplow", version = "1.0")]
+#[clap(name = "fatplow", version)]
 struct fatplowApp
 {
     #[clap(subcommand)]
