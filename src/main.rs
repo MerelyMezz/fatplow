@@ -1,7 +1,7 @@
 #![allow(bad_style, mismatched_lifetime_syntaxes)]
 
 use core::fmt;
-use std::{cell::{Cell, RefCell}, collections::{HashMap, VecDeque}, fmt::Formatter, fs::File, io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write}, os::unix::fs::MetadataExt, path::PathBuf, process::exit};
+use std::{cell::{Cell, RefCell}, collections::{HashMap, VecDeque}, fmt::Formatter, fs::File, io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::PathBuf, process::exit};
 use bincode::{Decode, Encode, config};
 use clap::{Parser, Subcommand};
 use itertools::Itertools;
@@ -429,7 +429,11 @@ impl<'a> FATFileSystem<'a>
 {
     fn new(OpenedFile : &'a File) -> Result<Self, FATCreateError>
     {
-        if OpenedFile.metadata().unwrap().size() < FATBootSectorSize
+        let mut R = BufReader::new(OpenedFile);
+        R.seek(SeekFrom::End(0)).unwrap();
+        let FileSize = R.stream_position().unwrap();
+
+        if FileSize < FATBootSectorSize
         {
             return Err(FATCreateError::TooSmallToLoadBS);
         }
@@ -456,7 +460,7 @@ impl<'a> FATFileSystem<'a>
             return Err(FATCreateError::InvalidBSSignature);
         }
 
-        if OpenedFile.metadata().unwrap().size() < (BS.Data.TotSec32 as u64 * BS.Data.BytsPerSec as u64)
+        if FileSize < (BS.Data.TotSec32 as u64 * BS.Data.BytsPerSec as u64)
         {
             return Err(FATCreateError::TooSmallAccordingToTotSec32);
         }
